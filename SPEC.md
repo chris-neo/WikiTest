@@ -30,7 +30,8 @@ Every note in `10-sources/**` has this frontmatter. YAML, in the order below for
 | `title`          | string          | yes      | extractor   | Source title; quotes only when needed.                                |
 | `authors`        | list[string]    | yes      | extractor   | Empty list `[]` if unknown — never omit the field.                    |
 | `source`         | enum            | yes      | extractor   | `medium \| oreilly \| manual \| web`.                                  |
-| `url`            | string          | yes      | extractor   | Canonical URL (after Medium tracking-param strip). Identity key.      |
+| `url`            | string          | yes      | extractor   | Canonical URL (after tracking-param strip). Display, not identity.    |
+| `external_id`    | string \| null  | yes      | extractor   | Source-specific stable ID. **Identity key.** Medium: 12-hex post ID.  |
 | `type`           | enum            | yes      | extractor   | `article \| book \| paper \| video \| podcast \| thread \| other`.    |
 | `date_published` | date \| null    | yes      | extractor   | ISO `YYYY-MM-DD`; `null` when unknown.                                |
 | `date_added`     | date            | yes      | extractor   | When the item entered the vault (creation only; never overwritten).   |
@@ -41,7 +42,7 @@ Every note in `10-sources/**` has this frontmatter. YAML, in the order below for
 | `rating`         | int 1–5 \| null | yes      | user        | `null` when unrated.                                                  |
 | `summary`        | string \| null  | yes      | extractor*  | One-paragraph summary. `null` until populated. \*See §1.4.            |
 
-Identity key: `url`. The extractor must locate an existing note by `url` before deciding to create vs. update.
+Identity key: `external_id`. For Medium, this is the trailing 12-hex post ID (every Medium URL ends in `-{12 hex}`). The same article appears under `medium.com/@user/…`, `<pub>.medium.com/…`, and custom domains; only the post ID is stable across hostnames. The extractor must locate an existing note by `external_id` before deciding to create vs. update. `url` is preserved as the display URL but is never the dedup key. If `external_id` cannot be derived (non-Medium source, malformed URL), fall back to canonical URL string equality.
 
 ### 1.3 Body template
 
@@ -68,7 +69,7 @@ The `> [!quote]-` callout is collapsed by default in Obsidian; it remains plain 
 
 Re-runs are idempotent (success criterion). To make that safe:
 
-- **Managed (always rewritten on re-run):** `title`, `authors`, `source`, `url`, `type`, `date_published`, full-text callout body.
+- **Managed (always rewritten on re-run):** `title`, `authors`, `source`, `url`, `external_id`, `type`, `date_published`, full-text callout body.
 - **Create-only (written once, never touched again):** `date_added`.
 - **User-owned (preserved verbatim if present):** `date_read`, `status` (unless still `queued` and a new extraction succeeds — see below), `topics`, `rating`, the `## Highlights` and `## Notes` sections.
 - **Mixed:**
@@ -124,40 +125,49 @@ uv run medium-import \
 
 ### 2.2 ZIP layout assumed
 
-Based on a current Medium "Download your information" export. The extractor must validate these files exist and fail fast with a clear message if not (so we can adjust):
+Based on the current Medium "Download your information" export (HTML-only, folder-grouped, stable since 2019). The extractor must validate these files exist and fail fast with a clear message if not:
 
-- `bookmarks/bookmarks.html` — list of saved articles. Source of truth for the set.
-- `lists/*.html` — custom lists (treated as additional bookmarks; deduped by URL).
-- `claps/claps.html` — optional; if present, used to seed `rating` heuristic (see §2.5). Off by default behind a flag, but documented.
+- `bookmarks/*.html` — saved articles (URLs + titles + timestamps only, **no body**). Source of truth for the bookmark set.
+- `lists/*.html` — custom lists (treated as additional bookmarks; deduped by `external_id`).
 - `profile/profile.html` — used only to set the export's "exported on" date for logs.
 
-**Open question for review:** does your ZIP actually include any cached article bodies? My working assumption is **no** — the export gives URLs + titles + dates only, so every bookmark becomes a stub unless `--html-cache` supplies the HTML. Confirm before implementation.
+**Confirmed by research:** bookmark/list HTML contains only links + titles + dates — no article body. Every saved-article note is therefore a stub unless `--html-cache` supplies the HTML for that post ID.
+
+**Out of scope for Phase 1:** `posts/*.html` (the user's own published articles, which *do* contain full bodies in the ZIP), `claps/`, `highlights/`, `pubs-following/`. Deferred to Phase 2.
 
 ### 2.3 Pipeline
 
 Per bookmark:
 
-1. **Parse bookmark entry** → `{url, title?, date_added?}`. Strip Medium tracking params (`?source=…`, `?sk=…`, `gi=…`) to get a canonical URL.
-2. **Locate existing note** by canonical `url` via the URL→path index (built once at start by reading frontmatter from `10-sources/medium/*.md`).
+1. **Parse bookmark entry** → `{url, title?, date_added?}`. Canonicalize URL:
+   - Strip query params: `source`, `sk`, `gi`, `responsesOpen`, `_branch_match_id`, `referer`, and any `utm_*`. Preserve all other params (rare but possible).
+   - Lowercase scheme + host.
+   - Derive `external_id`: regex the trailing `-([0-9a-f]{12})` from the path. If absent, leave `null` (the bookmark is non-standard; log a warning).
+2. **Locate existing note** by `external_id` via the index (built once at start by reading frontmatter from `10-sources/medium/*.md`). For bookmarks where `external_id` is null, fall back to canonical-URL equality.
 3. **Try to extract full text:**
-   - If `--html-cache/<sha1(url)>.html` exists → load it.
-   - Else if the ZIP contains an article body for that URL (only if §2.2 open question resolves "yes") → load it.
+   - If `--html-cache/<external_id>.html` exists → load it. (Cache filenames keyed on post ID, not URL hash, so the same article cached under any host resolves.)
    - Else → no body available, this is a stub.
-4. **HTML → markdown:**
-   - Primary: `trafilatura.extract(html, output_format="markdown", include_links=True, include_images=False)`.
-   - Fallback: if trafilatura returns empty/None, run `markdownify` on the parsed `<article>` (or `<main>`, or `<body>`).
+4. **Detect paywall** (before extraction):
+   - Parse JSON-LD; if `"isAccessibleForFree": false` → mark as paywalled.
+   - Paywalled HTML often has a truncated body; if extraction yields < 500 chars of prose, also classify as paywalled.
+   - Paywalled bookmarks become stubs with the TODO marker noting paywall specifically.
+5. **HTML → markdown** (Medium-tuned, primary path is markdownify-on-article-subtree per research findings on trafilatura code-block fidelity):
+   - Locate the article subtree: `<article>` > `<main>` > `<body>` (first that exists).
+   - Primary: `markdownify(article_subtree, heading_style="ATX", code_language_callback=None)`. Strip nav/footer/related-posts siblings before conversion.
+   - Fallback: `trafilatura.extract(html, output_format="markdown", include_links=True, include_images=False)` if markdownify yields < 500 chars or fails.
    - Stub if both yield nothing.
-5. **Derive metadata:**
-   - `authors`: from extractor output > meta tag `author` > Medium-specific `<a rel="author">` > `[]`.
-   - `date_published`: from extractor output > `<time datetime>` > `null`.
+   - Code blocks: Medium emits `<pre data-code-block-mode="…">` with no language class — language hints are unrecoverable from saved HTML; emit plain triple-backtick fences.
+6. **Derive metadata:**
+   - `authors`: JSON-LD `author` > meta `author` > `<a rel="author">` > `[]`.
+   - `date_published`: JSON-LD `datePublished` > `<time datetime>` > `null`.
    - `summary`: first 280-char prose paragraph, sentence-trimmed; `null` for stubs.
    - `type`: hard-coded `article` for Medium in Phase 1.
    - `tags`: `[source/medium, type/article]`.
-6. **Build the note** (create or update — see §2.4) and write atomically (write to `*.md.tmp`, fsync, rename).
+7. **Build the note** (create or update — see §2.4) and write atomically (write to `*.md.tmp`, fsync, rename).
 
 ### 2.4 Idempotent upsert
 
-- **Create path:** new file, full template, `date_added = today`, `status = queued`, `_summary_hash` set if summary present.
+- **Create path:** new file, full template, `date_added = today` (or bookmark timestamp if available), `status = queued`, `_summary_hash` set if summary present.
 - **Update path:**
   - Recompute managed fields from the source.
   - Read existing file, parse frontmatter + body sections.
@@ -261,28 +271,41 @@ Unit tests, all hermetic (no network, tmp_path for FS):
    - Populated → no-extract: previous body retained, warning emitted.
    - Re-run on identical input is byte-identical (idempotency).
    - Two bookmarks with same canonical URL but different tracking params resolve to one note.
+   - Two bookmarks with the same `external_id` but different hostnames (`medium.com/@user/…-abc123def456` and `pub.medium.com/…-abc123def456`) resolve to one note.
 
 4. **`test_extract.py`**
-   - Known sample HTML → expected markdown (golden).
-   - Trafilatura empty → markdownify fallback returns non-empty for the same fixture (a deliberately tricky one).
+   - Known Medium sample HTML → expected markdown (golden), via markdownify-primary path.
+   - Markdownify yields short/empty → trafilatura fallback returns non-empty for the same fixture.
    - Both empty → returns `None` cleanly, no exception.
-   - Author / `date_published` extraction from meta tags.
+   - Author / `date_published` extraction from JSON-LD.
+   - Author / `date_published` fallback to `<meta>` and `<time>` when JSON-LD absent.
+   - Paywall fixture: JSON-LD `isAccessibleForFree: false` → classified as paywalled before extraction runs.
+   - Code block fixture: `<pre data-code-block-mode>` → fenced markdown, no language hint (documented limitation).
    - Summary truncation: ends on sentence boundary, ≤ 280 chars.
 
 5. **`test_bookmarks.py`**
-   - Parses Medium `bookmarks.html` fixture into expected list of `(url, title, date_added)`.
-   - Strips tracking params on canonicalization.
-   - Deduplicates across `bookmarks.html` + a `lists/*.html` fixture.
+   - Parses Medium `bookmarks/*.html` fixture into expected list of `(url, title, date_added)`.
+   - Strips tracking params on canonicalization (`source`, `sk`, `gi`, `responsesOpen`, `_branch_match_id`, `utm_*`).
+   - `external_id` derivation: extracts trailing 12-hex from path; returns `null` for malformed.
+   - Same `external_id` under three different hostnames (`medium.com/@user`, `pub.medium.com`, custom domain) deduplicates to one entry.
+   - Deduplicates across multiple `bookmarks/*.html` + `lists/*.html` fixtures.
    - Malformed entry → skipped with a warning, doesn't abort parsing.
 
 Manual smoke test (post-suite): run `medium-import --vault <real vault> --zip <real ZIP> --dry-run` then without dry-run; eyeball 3 sample notes in Obsidian (frontmatter parses, callout collapses, links intact); re-run and confirm 0 created / 0 modified.
 
 ## 4. Open questions for you
 
-1. **Article bodies in the ZIP** — does your Medium export include any HTML for saved articles, or only URLs + metadata? (Affects whether `--html-cache` is the only extraction path or merely the supplementary one.)
-2. **`status/*` mirror tags** — do you want me to maintain them automatically despite the drift risk, or leave them off (current proposal)?
-3. **`claps.html` → `rating` heuristic** — drop entirely from Phase 1? It's gimmicky.
-4. **Vault root** — should the extractor accept `--vault` pointing at the vault root, or directly at `10-sources/medium/`? Current: vault root.
-5. **Filename rename on title change** — current proposal locks filenames. Confirm or override.
+Resolved by research + your answers:
+- ~~Article bodies in the ZIP~~ — confirmed URL-only for `bookmarks/`/`lists/`. `--html-cache` is the only extraction path.
+- ~~Dedup key~~ — switched from URL to Medium 12-hex post ID via `external_id` field.
+- ~~Own posts (`posts/`)~~ — deferred to Phase 2 (out of scope here).
+- ~~Code-block strategy~~ — markdownify-on-article-subtree primary, trafilatura fallback for Medium specifically.
 
-Once you've signed off (or marked up edits), I'll implement against this spec.
+Still open:
+
+1. **`status/*` mirror tags** — maintain automatically despite drift risk, or leave off (current)?
+2. **`claps.html` → `rating` heuristic** — drop entirely from Phase 1? Currently dropped.
+3. **Vault root** — `--vault` points at vault root. Confirm.
+4. **Filename rename on title change** — current proposal locks filenames. Confirm or override.
+
+Once you've signed off, I'll implement against this spec.
