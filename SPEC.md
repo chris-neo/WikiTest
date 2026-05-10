@@ -39,7 +39,7 @@ Every note in `10-sources/**` has this frontmatter. YAML, in the order below for
 | `status`         | enum            | yes      | mixed       | `queued \| reading \| read \| archived \| dropped`. Default `queued`. |
 | `topics`         | list[string]    | yes      | user        | Controlled vocabulary (see `tags.md`). May be `[]`.                   |
 | `tags`           | list[string]    | yes      | mixed       | Obsidian tags. Auto-tags are additive; user tags preserved.           |
-| `rating`         | int 1–5 \| null | yes      | user        | `null` when unrated.                                                  |
+| `rating`         | int 1–5 \| null | yes      | mixed       | Seeded from `claps.html` on first import (see §2.3); user-edited values preserved. `null` when no signal. |
 | `summary`        | string \| null  | yes      | extractor*  | One-paragraph summary. `null` until populated. \*See §1.4.            |
 
 Identity key: `external_id`. For Medium, this is the trailing 12-hex post ID (every Medium URL ends in `-{12 hex}`). The same article appears under `medium.com/@user/…`, `<pub>.medium.com/…`, and custom domains; only the post ID is stable across hostnames. The extractor must locate an existing note by `external_id` before deciding to create vs. update. `url` is preserved as the display URL but is never the dedup key. If `external_id` cannot be derived (non-Medium source, malformed URL), fall back to canonical URL string equality.
@@ -71,7 +71,8 @@ Re-runs are idempotent (success criterion). To make that safe:
 
 - **Managed (always rewritten on re-run):** `title`, `authors`, `source`, `url`, `external_id`, `type`, `date_published`, full-text callout body.
 - **Create-only (written once, never touched again):** `date_added`.
-- **User-owned (preserved verbatim if present):** `date_read`, `status` (unless still `queued` and a new extraction succeeds — see below), `topics`, `rating`, the `## Highlights` and `## Notes` sections.
+- **User-owned (preserved verbatim if present):** `date_read`, `status` (unless still `queued` and a new extraction succeeds — see below), `topics`, the `## Highlights` and `## Notes` sections.
+- **Seeded once, then user-owned:** `rating` — set from claps data when transitioning `null → <value>` (so a re-run can fill in a rating that wasn't seedable before, e.g. user clapped after the bookmark was created). Once non-null, never overwritten. User can clear back to `null` and the extractor will re-seed; if you want to suppress that, set the value to anything non-null.
 - **Mixed:**
   - `tags`: extractor maintains a set of auto-tags (e.g. `source/medium`, `type/article`); user-added tags are preserved. On re-run we recompute auto-tags and merge with the existing tag list minus any auto-tags that no longer apply.
   - `summary`: written by extractor on first create. Re-run only overwrites if the user hasn't edited it. We detect user edits by storing the auto-generated summary's hash in a hidden frontmatter field `_summary_hash`; if the live summary's hash matches, we may regenerate, otherwise leave it.
@@ -129,11 +130,12 @@ Based on the current Medium "Download your information" export (HTML-only, folde
 
 - `bookmarks/*.html` — saved articles (URLs + titles + timestamps only, **no body**). Source of truth for the bookmark set.
 - `lists/*.html` — custom lists (treated as additional bookmarks; deduped by `external_id`).
+- `claps/claps.html` — articles the user clapped for, with clap counts (1–50). Used to seed `rating` (see §2.3 step 6). Optional: extractor warns if absent and skips seeding.
 - `profile/profile.html` — used only to set the export's "exported on" date for logs.
 
 **Confirmed by research:** bookmark/list HTML contains only links + titles + dates — no article body. Every saved-article note is therefore a stub unless `--html-cache` supplies the HTML for that post ID.
 
-**Out of scope for Phase 1:** `posts/*.html` (the user's own published articles, which *do* contain full bodies in the ZIP), `claps/`, `highlights/`, `pubs-following/`. Deferred to Phase 2.
+**Out of scope for Phase 1:** `posts/*.html` (the user's own published articles, which *do* contain full bodies in the ZIP), `highlights/`, `pubs-following/`. Deferred to Phase 2.
 
 ### 2.3 Pipeline
 
@@ -163,6 +165,7 @@ Per bookmark:
    - `summary`: first 280-char prose paragraph, sentence-trimmed; `null` for stubs.
    - `type`: hard-coded `article` for Medium in Phase 1.
    - `tags`: `[source/medium, type/article]`.
+   - `rating`: lookup `external_id` in the claps index built from `claps/claps.html` at startup. If found and the existing note's `rating` is `null` (or the note is being created), map clap count to a 1–5 rating using a linear bucket: `1–10 → 1`, `11–20 → 2`, `21–30 → 3`, `31–40 → 4`, `41–50 → 5`. Otherwise leave existing `rating` untouched.
 7. **Build the note** (create or update — see §2.4) and write atomically (write to `*.md.tmp`, fsync, rename).
 
 ### 2.4 Idempotent upsert
@@ -223,7 +226,8 @@ src/
     __init__.py
     cli.py
     bookmarks.py        # parse Medium bookmark/list HTML
-    extract.py          # HTML → markdown via trafilatura/markdownify
+    claps.py            # parse claps/claps.html into {external_id: clap_count}
+    extract.py          # HTML → markdown via markdownify/trafilatura
     note.py             # frontmatter + body model, render, parse
     upsert.py           # index, create-or-update, atomic write
     slug.py
@@ -233,12 +237,14 @@ tests/
     sample_bookmark.html
     sample_article.html
     sample_paywalled.html
+    sample_claps.html
     existing_note.md
   test_slug.py
   test_note.py
   test_upsert.py
   test_extract.py
   test_bookmarks.py
+  test_claps.py
 ```
 
 ## 3. Test list
@@ -291,21 +297,27 @@ Unit tests, all hermetic (no network, tmp_path for FS):
    - Deduplicates across multiple `bookmarks/*.html` + `lists/*.html` fixtures.
    - Malformed entry → skipped with a warning, doesn't abort parsing.
 
+6. **`test_claps.py`**
+   - Parses `claps/claps.html` fixture into `{external_id: clap_count}`.
+   - Bucket boundaries: 1, 10, 11, 20, 21, 30, 31, 40, 41, 50 → expected ratings 1, 1, 2, 2, 3, 3, 4, 4, 5, 5.
+   - Out-of-range clap count (>50, malformed) → skipped with warning.
+   - Upsert integration: rating null + clap entry exists → rating gets seeded.
+   - Upsert integration: rating already 4 + clap entry says 1 → rating preserved.
+   - Upsert integration: claps file absent → no rating set, no error.
+
 Manual smoke test (post-suite): run `medium-import --vault <real vault> --zip <real ZIP> --dry-run` then without dry-run; eyeball 3 sample notes in Obsidian (frontmatter parses, callout collapses, links intact); re-run and confirm 0 created / 0 modified.
 
-## 4. Open questions for you
+## 4. Decisions log
 
-Resolved by research + your answers:
-- ~~Article bodies in the ZIP~~ — confirmed URL-only for `bookmarks/`/`lists/`. `--html-cache` is the only extraction path.
-- ~~Dedup key~~ — switched from URL to Medium 12-hex post ID via `external_id` field.
-- ~~Own posts (`posts/`)~~ — deferred to Phase 2 (out of scope here).
-- ~~Code-block strategy~~ — markdownify-on-article-subtree primary, trafilatura fallback for Medium specifically.
+All resolved.
 
-Still open:
+- **Article bodies in the ZIP** — confirmed URL-only for `bookmarks/`/`lists/`. `--html-cache` is the only extraction path.
+- **Dedup key** — Medium 12-hex post ID via `external_id` field.
+- **Own posts (`posts/`)** — deferred to Phase 2.
+- **Code-block strategy** — markdownify-on-article-subtree primary, trafilatura fallback (Medium-specific).
+- **`status/*` mirror tags** — not maintained automatically.
+- **`claps.html` → `rating`** — seeded on first import (linear 1–50 → 1–5 mapping); preserved once user-set.
+- **`--vault` flag** — points at vault root.
+- **Filename on title change** — locked at creation; only frontmatter `title` updates.
 
-1. **`status/*` mirror tags** — maintain automatically despite drift risk, or leave off (current)?
-2. **`claps.html` → `rating` heuristic** — drop entirely from Phase 1? Currently dropped.
-3. **Vault root** — `--vault` points at vault root. Confirm.
-4. **Filename rename on title change** — current proposal locks filenames. Confirm or override.
-
-Once you've signed off, I'll implement against this spec.
+Spec is locked. Ready to implement on approval.
